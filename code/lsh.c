@@ -38,6 +38,9 @@ void stripwhite(char *);
 // Current foreground pid
 static pid_t fg_pid = 0;
 
+#define READ_END 0
+#define WRITE_END 1
+
 void handle_child_finished(int sig)
 {
   // Get status of child process using waitpid
@@ -86,7 +89,7 @@ void change_directory(Command *cmd)
 
 void handle_cmd(Command *cmd)
 {
-  // Check for built-in command
+  // Check for built-in commands
   if (strcmp(cmd->pgm->pgmlist[0], "cd") == 0)
   {
     change_directory(cmd);
@@ -95,39 +98,106 @@ void handle_cmd(Command *cmd)
   else if (strcmp(cmd->pgm->pgmlist[0], "exit") == 0)
   {
     kill(0, SIGINT);
+    exit(0);
     return;
   }
 
-  // If not built in, commands should be handled by forking and doing the appropriate work
-  pid_t pid = fork();
+  // Count command depth
+  int command_count = 0;
+  Pgm *pgm = cmd->pgm;
+  while (pgm != NULL)
+  {
+    command_count++;
+    pgm = pgm->next;
+  }
+  printf("Cmd count: %d", command_count);
 
-  if (pid == 0) // Child process
+  // int fds[command_count - 1][2];
+
+  // Create pipes for each command but last (1 less pipe per command)
+  // for (int i = 0; i < command_count - 1; i++)
+  // {
+  //   if (pipe(fds[i]) == -1)
+  //   {
+  //     printf("Pipe creation failed");
+  //     return;
+  //   }
+  // }
+
+  int prev_write;
+
+  for (int i = 0; i < command_count; i++)
   {
-    // Get and execute command, see if there are params
-    execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
-    // If exec returns, it has failed
-    printf("Could not execute program \"%s\"\n", cmd->pgm->pgmlist[0]);
-    _exit(-1);
-  }
-  else if (pid == -1) // Fork error
-  {
-    printf("Fork error\n");
-    kill(0, SIGINT);
-  }
-  else // Parent process
-  {
-    // Check if command is to be run in background
-    if (cmd->background == 1)
+    // If this is not the last command, create a pipe
+    int fd[2];
+    if (i < command_count - 1)
     {
-      // Print pid of background process
-      printf("pid: %d\n", pid);
-      waitpid(pid, NULL, WNOHANG);
+      pipe(fd);
     }
-    else
+
+    pid_t pid = fork();
+
+    if (pid == 0) // Child process
     {
-      fg_pid = pid;
-      waitpid(pid, NULL, 0);
+      if (cmd->background == 1)
+      {
+        setpgid(0, 0); // Set child process in new process group
+      }
+
+      if (command_count > 1)
+      {
+        // If not rightmost command
+        if (i > 0)
+        {
+          // Redirect stdout to right command (i-1)
+          dup2(prev_write, STDOUT_FILENO);
+          close(prev_write);
+        }
+
+        // If not leftmost command
+        if (i < command_count - 1)
+        {
+          // Redirect stdin to out of left command
+          dup2(fd[READ_END], STDIN_FILENO);
+          close(fd[READ_END]);
+          prev_write = fd[WRITE_END];
+        }
+      }
+
+      // Get and execute command, see if there are params
+      execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
+
+      // If exec returns, it has failed
+      printf("Could not execute program \"%s\"\n", cmd->pgm->pgmlist[0]);
+      _exit(-1);
     }
+    else if (pid == -1) // Fork error
+    {
+      printf("Fork error\n");
+      kill(0, SIGINT);
+    }
+    else // Parent process
+    {
+      if (command_count > 1) // Close pipes for parent
+      {
+        close(fd[READ_END]);
+        close(fd[WRITE_END]);
+      }
+      // Check if command is to be run in background
+      if (cmd->background == 1)
+      {
+        // Print pid of background process
+        // Set background process in another process group
+        printf("pid: %d\n", pid);
+        waitpid(pid, NULL, WNOHANG);
+      }
+      else
+      {
+        fg_pid = pid;
+        waitpid(pid, NULL, 0);
+      }
+    }
+    cmd->pgm = cmd->pgm->next;
   }
 }
 
@@ -142,13 +212,78 @@ void handle_sigint(int sig)
 {
   if (fg_pid != 0)
   {
+    printf("Killing foreground process %d\n", fg_pid);
     kill(fg_pid, SIGINT);
+    fg_pid = 0;
   }
   else
   {
     printf("\n");
   }
   return;
+}
+
+void pipeline(Command *cmd, int fd_old_write)
+{
+  if (fd_old_write >= 0)
+  {
+    // Reroute STDOUT to old pipe write
+    dup2(fd_old_write, STDOUT_FILENO);
+    close(fd_old_write);
+  }
+
+  if (cmd->pgm->next == NULL)
+  {
+    execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
+    fprintf(stderr, "Could not execute program %s\n", cmd->pgm->pgmlist[0]);
+    _exit(-1);
+  }
+
+  int fd[2];
+  pipe(fd);
+
+  pid_t pid = fork();
+
+  if (pid == 0) // Process to execute next command
+  {
+    if (cmd->pgm->next != NULL)
+    {
+      cmd->pgm = cmd->pgm->next;
+      pipeline(cmd, fd[WRITE_END]);
+    }
+  }
+  else if (pid == -1)
+  {
+    fprintf(stderr, "Fork error");
+    kill(0, SIGINT);
+  }
+  else
+  {
+    // Reroute stdin to read end of pipe
+    dup2(fd[READ_END], STDIN_FILENO);
+    close(fd[READ_END]);
+    close(fd[WRITE_END]);
+    execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
+  }
+}
+
+void handle_cmd2(Command *cmd)
+{
+  pid_t pid = fork();
+
+  if (pid == 0)
+  {
+    pipeline(cmd, -1);
+  }
+  else if (pid == -1)
+  {
+    fprintf(stderr, "Fork error");
+    kill(0, SIGINT);
+  }
+  else
+  {
+    waitpid(pid, NULL, 0);
+  }
 }
 
 int main(void)
@@ -170,7 +305,7 @@ int main(void)
     if (line == NULL)
     {
       kill(0, SIGINT);
-      exit(0);
+      return 0;
     }
 
     // Remove leading and trailing whitespace from the line
@@ -188,7 +323,7 @@ int main(void)
         print_cmd(&cmd);
 
         // Handle commands
-        handle_cmd(&cmd);
+        handle_cmd2(&cmd);
       }
       else
       {
