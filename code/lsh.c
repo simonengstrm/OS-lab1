@@ -18,11 +18,11 @@
  */
 #include <assert.h>
 #include <ctype.h>
-#include <readline/readline.h>
-#include <readline/history.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 #include <signal.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -48,13 +48,15 @@ void handle_child_finished(int sig)
   int status;
   // -1 for any child process
   pid_t pid = waitpid(-1, &status, WNOHANG);
+  if (pid == fg_pid)
+    return;
   if (status == 0)
   {
-    printf("\nChild process %d exited normally\n", pid);
+    printf("\n[%d]\n", pid);
   }
   else
   {
-    printf("\nChild process %d exited with status %d\n", pid, status);
+    printf("\n[%d]: exit status %d\n", pid, status);
   }
   return;
 }
