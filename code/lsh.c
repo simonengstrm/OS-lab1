@@ -25,6 +25,7 @@
 #include <string.h>
 #include <signal.h>
 #include <limits.h>
+#include <fcntl.h>
 
 // The <unistd.h> header is your gateway to the OS's process management facilities.
 #include <unistd.h>
@@ -87,120 +88,6 @@ void change_directory(Command *cmd)
   return;
 }
 
-void handle_cmd(Command *cmd)
-{
-  // Check for built-in commands
-  if (strcmp(cmd->pgm->pgmlist[0], "cd") == 0)
-  {
-    change_directory(cmd);
-    return;
-  }
-  else if (strcmp(cmd->pgm->pgmlist[0], "exit") == 0)
-  {
-    kill(0, SIGINT);
-    exit(0);
-    return;
-  }
-
-  // Count command depth
-  int command_count = 0;
-  Pgm *pgm = cmd->pgm;
-  while (pgm != NULL)
-  {
-    command_count++;
-    pgm = pgm->next;
-  }
-  printf("Cmd count: %d", command_count);
-
-  // int fds[command_count - 1][2];
-
-  // Create pipes for each command but last (1 less pipe per command)
-  // for (int i = 0; i < command_count - 1; i++)
-  // {
-  //   if (pipe(fds[i]) == -1)
-  //   {
-  //     printf("Pipe creation failed");
-  //     return;
-  //   }
-  // }
-
-  int prev_write;
-
-  for (int i = 0; i < command_count; i++)
-  {
-    // If this is not the last command, create a pipe
-    int fd[2];
-    if (i < command_count - 1)
-    {
-      pipe(fd);
-    }
-
-    pid_t pid = fork();
-
-    if (pid == 0) // Child process
-    {
-      if (cmd->background == 1)
-      {
-        setpgid(0, 0); // Set child process in new process group
-      }
-
-      if (command_count > 1)
-      {
-        // If not rightmost command
-        if (i > 0)
-        {
-          // Redirect stdout to right command (i-1)
-          dup2(prev_write, STDOUT_FILENO);
-          close(prev_write);
-        }
-
-        // If not leftmost command
-        if (i < command_count - 1)
-        {
-          // Redirect stdin to out of left command
-          dup2(fd[READ_END], STDIN_FILENO);
-          close(fd[READ_END]);
-          prev_write = fd[WRITE_END];
-        }
-      }
-
-      // Get and execute command, see if there are params
-      execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
-
-      // If exec returns, it has failed
-      printf("Could not execute program \"%s\"\n", cmd->pgm->pgmlist[0]);
-      _exit(-1);
-    }
-    else if (pid == -1) // Fork error
-    {
-      printf("Fork error\n");
-      kill(0, SIGINT);
-    }
-    else // Parent process
-    {
-      if (command_count > 1) // Close pipes for parent
-      {
-        close(fd[READ_END]);
-        close(fd[WRITE_END]);
-      }
-      // Check if command is to be run in background
-      if (cmd->background == 1)
-      {
-        // Print pid of background process
-        // Set background process in another process group
-        printf("pid: %d\n", pid);
-        waitpid(pid, NULL, WNOHANG);
-      }
-      else
-      {
-        fg_pid = pid;
-        waitpid(pid, NULL, 0);
-      }
-    }
-    cmd->pgm = cmd->pgm->next;
-  }
-}
-
 void handle_sigtstp(int sig)
 {
   printf("Caught SIGTSTP\n");
@@ -234,6 +121,34 @@ void pipeline(Command *cmd, int fd_old_write)
 
   if (cmd->pgm->next == NULL)
   {
+    // Check for file redirect
+    if (cmd->rstdin != NULL)
+    {
+      // Redirect stdout to open(file)
+      int in = open(cmd->rstdin, O_RDONLY);
+      if (in == -1)
+      {
+        fprintf(stderr, "Cloud not redirect input from file %s\n", cmd->rstdin);
+        _exit(1);
+      }
+
+      dup2(in, STDIN_FILENO);
+      close(in);
+    }
+
+    // If only one command (fd_old_write = -1 in base case) redirect stdout here too
+    if (cmd->rstdout != NULL && fd_old_write == -1)
+    {
+      int out = open(cmd->rstdout, O_TRUNC | O_WRONLY | O_CREAT);
+      if (out == -1)
+      {
+        fprintf(stderr, "Could not redirect output to file %s\n", cmd->rstdout);
+        _exit(-1);
+      }
+      dup2(out, STDOUT_FILENO);
+      close(out);
+    }
+
     execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
     fprintf(stderr, "Could not execute program %s\n", cmd->pgm->pgmlist[0]);
     _exit(-1);
@@ -246,6 +161,11 @@ void pipeline(Command *cmd, int fd_old_write)
 
   if (pid == 0) // Process to execute next command
   {
+    if (cmd->background == 1) // Change process group if background
+    {
+      setpgid(0, 0);
+    }
+
     if (cmd->pgm->next != NULL)
     {
       cmd->pgm = cmd->pgm->next;
@@ -263,6 +183,22 @@ void pipeline(Command *cmd, int fd_old_write)
     dup2(fd[READ_END], STDIN_FILENO);
     close(fd[READ_END]);
     close(fd[WRITE_END]);
+
+    // If rightmost command, check rstdout and redirect if needed
+    // First command always gets -1 as fd_old_write
+    if (fd_old_write == -1 && cmd->rstdout != NULL)
+    {
+      int out = open(cmd->rstdout, O_TRUNC | O_WRONLY | O_CREAT);
+      if (out == -1)
+      {
+        fprintf(stderr, "Could not redirect output to file %s\n", cmd->rstdout);
+        _exit(-1);
+      }
+      dup2(out, STDOUT_FILENO);
+      close(out);
+    }
+
+    waitpid(pid, NULL, 0);
     execvp(cmd->pgm->pgmlist[0], cmd->pgm->pgmlist);
   }
 }
@@ -273,6 +209,11 @@ void handle_cmd2(Command *cmd)
 
   if (pid == 0)
   {
+    if (cmd->background == 1)
+    {
+      setpgid(0, 0);
+    }
+
     pipeline(cmd, -1);
   }
   else if (pid == -1)
@@ -282,7 +223,16 @@ void handle_cmd2(Command *cmd)
   }
   else
   {
-    waitpid(pid, NULL, 0);
+    if (cmd->background == 1)
+    {
+      printf("pid: %d\n", pid);
+      waitpid(pid, NULL, WNOHANG);
+    }
+    else
+    {
+      fg_pid = pid;
+      waitpid(pid, NULL, 0);
+    }
   }
 }
 
@@ -321,6 +271,19 @@ int main(void)
       {
         // Just prints cmd
         print_cmd(&cmd);
+
+        // Check for built-in commands
+        if (strcmp(cmd.pgm->pgmlist[0], "cd") == 0)
+        {
+          change_directory(&cmd);
+          continue;
+        }
+        else if (strcmp(cmd.pgm->pgmlist[0], "exit") == 0)
+        {
+          kill(0, SIGINT);
+          exit(0);
+          return 0;
+        }
 
         // Handle commands
         handle_cmd2(&cmd);
