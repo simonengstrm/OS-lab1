@@ -1,7 +1,7 @@
 from datetime import datetime
-from os import mkdir, setsid, killpg, getpgid
+from os import mkdir, setsid, kill, killpg, getpgid
 from pathlib import Path
-from signal import SIGINT
+from signal import SIGINT, SIGTERM
 from socket import gethostname
 from subprocess import run, PIPE, Popen, TimeoutExpired
 from tempfile import gettempdir
@@ -307,7 +307,7 @@ class TestLsh(unittest.TestCase):
         lsh_info = ProcessInfo(self.lsh.pid)
         self.assertEqual(1, len(lsh_info.children()), msg="I did not expect to see more than 1 child processes "
                                                           "after executing a background command")
-        bg_pid = lsh_info.children()[0]
+        bg_pid = lsh_info.children()[0].pid
 
         # Start foreground process
         self.run_cmd("sleep 60")
@@ -319,7 +319,9 @@ class TestLsh(unittest.TestCase):
         sleep(1)
 
         self.assertEqual(1, len(lsh_info.children()), msg="There should be only one child process after Ctrl+C")
-        self.assertEqual(bg_pid, lsh_info.children()[0], msg="You should not have terminated the background process")
+        self.assertEqual(bg_pid, lsh_info.children()[0].pid, msg="You should not have terminated the background process")
+
+        kill(bg_pid, SIGTERM)
         self.exit_with_eof()
 
 if __name__ == "__main__":
